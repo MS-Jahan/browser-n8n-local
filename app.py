@@ -8,17 +8,16 @@ import uuid
 import base64
 import mimetypes
 
-from typing import Dict, List, Optional, Union, Any
+from typing import Optional
 from datetime import datetime, UTC
 from enum import Enum
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, Response, Query
+from fastapi import FastAPI, HTTPException, Request, Response, Query, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.encoders import jsonable_encoder
 
 from langchain_anthropic import ChatAnthropic
 from langchain_mistralai import ChatMistralAI
@@ -26,7 +25,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
 from langchain_aws import ChatBedrock
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # This import will work once browser-use is installed
 # For development, you may need to add the browser-use repo to your PYTHONPATH
@@ -34,9 +33,13 @@ from browser_use import Agent
 from browser_use.agent.views import AgentHistoryList
 from browser_use import BrowserConfig, Browser
 from browser_use.browser.browser import Browser, BrowserConfig
-from browser_use.browser.context import BrowserContext, BrowserContextConfig
+from browser_use.browser.context import BrowserContext
 
 from pathlib import Path
+
+# Import our task storage abstraction
+from task_storage import get_task_storage
+from task_storage.base import DEFAULT_USER_ID
 
 
 # Define task status enum
@@ -114,8 +117,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Task storage - in memory for now
-tasks: Dict[str, Dict] = {}
+# Initialize task storage
+task_storage = get_task_storage()
 
 
 # Models
@@ -139,6 +142,12 @@ class TaskStatusResponse(BaseModel):
     status: str
     result: Optional[str] = None
     error: Optional[str] = None
+
+
+# Dependency to get user_id from headers
+async def get_user_id(x_user_id: Optional[str] = Header(None)) -> str:
+    """Extract user ID from header or use default"""
+    return x_user_id or DEFAULT_USER_ID
 
 
 # Utility functions
@@ -176,7 +185,7 @@ def get_llm(ai_provider: str):
         return ChatOpenAI(**kwargs)
 
 
-async def execute_task(task_id: str, instruction: str, ai_provider: str):
+async def execute_task(task_id: str, instruction: str, ai_provider: str, user_id: str = DEFAULT_USER_ID):
     """Execute browser task in background
 
     Chrome paths (CHROME_PATH and CHROME_USER_DATA) are only sourced from
@@ -186,17 +195,14 @@ async def execute_task(task_id: str, instruction: str, ai_provider: str):
     browser = None
     try:
         # Update task status
-        tasks[task_id]["status"] = TaskStatus.RUNNING
+        task_storage.update_task_status(task_id, TaskStatus.RUNNING, user_id)
 
         # Get LLM
         llm = get_llm(ai_provider)
 
         # Get task-specific browser configuration if available
-        task_browser_config = tasks[task_id].get("browser_config", {})
-
-        # Initialize media collections with type classification
-        if "media" not in tasks[task_id]:
-            tasks[task_id]["media"] = []
+        task = task_storage.get_task(task_id, user_id)
+        task_browser_config = task.get("browser_config", {}) if task else {}
 
         # Create task media directory up front
         task_media_dir = MEDIA_DIR / task_id
@@ -270,62 +276,70 @@ async def execute_task(task_id: str, instruction: str, ai_provider: str):
         # Pass the browser to Agent
         agent = Agent(**agent_kwargs)
 
-        # Store agent in tasks
-        tasks[task_id]["agent"] = agent
+        # Store agent in task
+        task_storage.set_task_agent(task_id, agent, user_id)
 
         # Run agent
-        result = await agent.run()
+        result = await agent.run(
+            on_step_end=lambda agent_instance: automated_screenshot(agent_instance, task_id, user_id)
+        )
 
-        # Update finished timestamp
-        tasks[task_id]["finished_at"] = datetime.now(UTC).isoformat() + "Z"
-
-        # Update task status
-        tasks[task_id]["status"] = TaskStatus.FINISHED
+        # Update finished timestamp and task status
+        task_storage.mark_task_finished(task_id, user_id, TaskStatus.FINISHED)
 
         # Extract result
         if isinstance(result, AgentHistoryList):
             final_result = result.final_result()
-            tasks[task_id]["output"] = final_result
+            task_storage.set_task_output(task_id, final_result, user_id)
         else:
-            tasks[task_id]["output"] = str(result)
+            task_storage.set_task_output(task_id, str(result), user_id)
 
         # Collect browser data if requested
-        if tasks[task_id]["save_browser_data"] and hasattr(agent, "browser"):
+        task = task_storage.get_task(task_id, user_id)
+        if task and task.get("save_browser_data") and hasattr(agent, "browser"):
             try:
                 # Try multiple approaches to collect browser data
                 if hasattr(agent.browser, "get_cookies"):
                     # Direct method if available
                     cookies = await agent.browser.get_cookies()
-                    tasks[task_id]["browser_data"] = {"cookies": cookies}
+                    task_storage.update_task(task_id, {"browser_data": {"cookies": cookies}}, user_id)
                 elif hasattr(agent.browser, "page") and hasattr(
                     agent.browser.page, "cookies"
                 ):
                     # Try Playwright's page.cookies() method
                     cookies = await agent.browser.page.cookies()
-                    tasks[task_id]["browser_data"] = {"cookies": cookies}
+                    task_storage.update_task(task_id, {"browser_data": {"cookies": cookies}}, user_id)
                 elif hasattr(agent.browser, "context") and hasattr(
                     agent.browser.context, "cookies"
                 ):
                     # Try Playwright's context.cookies() method
                     cookies = await agent.browser.context.cookies()
-                    tasks[task_id]["browser_data"] = {"cookies": cookies}
+                    task_storage.update_task(task_id, {"browser_data": {"cookies": cookies}}, user_id)
                 else:
                     logger.warning(
                         f"No known method to collect cookies for task {task_id}"
                     )
-                    tasks[task_id]["browser_data"] = {
-                        "cookies": [],
-                        "error": "No method available to collect cookies",
-                    }
+                    task_storage.update_task(
+                        task_id, 
+                        {"browser_data": {
+                            "cookies": [],
+                            "error": "No method available to collect cookies"
+                        }},
+                        user_id
+                    )
             except Exception as e:
                 logger.error(f"Failed to collect browser data: {str(e)}")
-                tasks[task_id]["browser_data"] = {"cookies": [], "error": str(e)}
+                task_storage.update_task(
+                    task_id, 
+                    {"browser_data": {"cookies": [], "error": str(e)}},
+                    user_id
+                )
 
     except Exception as e:
         logger.exception(f"Error executing task {task_id}")
-        tasks[task_id]["status"] = TaskStatus.FAILED
-        tasks[task_id]["error"] = str(e)
-        tasks[task_id]["finished_at"] = datetime.now(UTC).isoformat() + "Z"
+        task_storage.update_task_status(task_id, TaskStatus.FAILED, user_id)
+        task_storage.set_task_error(task_id, str(e), user_id)
+        task_storage.mark_task_finished(task_id, user_id, TaskStatus.FAILED)
     finally:
         # Always close the browser, regardless of success or failure
         if browser is not None:
@@ -335,44 +349,48 @@ async def execute_task(task_id: str, instruction: str, ai_provider: str):
                     f"Taking final screenshot for task {task_id} after completion"
                 )
 
-                # Take screenshot using agent's browser context
-                screenshot_b64 = result.history[-1].state.screenshot
+                # Get agent to take screenshot
+                agent = task_storage.get_task_agent(task_id, user_id)
+                if agent and hasattr(agent, "browser_context"):
+                    # Take screenshot using agent's browser context
+                    result = await agent.run()
+                    screenshot_b64 = result.history[-1].state.screenshot
 
-                if screenshot_b64:
-                    # Create task media directory if it doesn't exist
-                    task_media_dir = MEDIA_DIR / task_id
-                    task_media_dir.mkdir(exist_ok=True, parents=True)
+                    if screenshot_b64:
+                        # Create task media directory if it doesn't exist
+                        task_media_dir = MEDIA_DIR / task_id
+                        task_media_dir.mkdir(exist_ok=True, parents=True)
 
-                    # Save screenshot
-                    screenshot_filename = "final_result.png"
-                    screenshot_path = task_media_dir / screenshot_filename
+                        # Save screenshot
+                        screenshot_filename = "final_result.png"
+                        screenshot_path = task_media_dir / screenshot_filename
 
-                    # Decode base64 and save as file
-                    try:
-                        image_data = base64.b64decode(screenshot_b64)
-                        with open(screenshot_path, "wb") as f:
-                            f.write(image_data)
+                        # Decode base64 and save as file
+                        try:
+                            image_data = base64.b64decode(screenshot_b64)
+                            with open(screenshot_path, "wb") as f:
+                                f.write(image_data)
 
-                        # Verify file was created and has content
-                        if (
-                            screenshot_path.exists()
-                            and screenshot_path.stat().st_size > 0
-                        ):
-                            logger.info(
-                                f"Final screenshot saved: {screenshot_path} ({screenshot_path.stat().st_size} bytes)"
-                            )
+                            # Verify file was created and has content
+                            if (
+                                screenshot_path.exists()
+                                and screenshot_path.stat().st_size > 0
+                            ):
+                                logger.info(
+                                    f"Final screenshot saved: {screenshot_path} ({screenshot_path.stat().st_size} bytes)"
+                                )
 
-                            # Add to media list with type
-                            screenshot_url = f"/media/{task_id}/{screenshot_filename}"
-                            media_entry = {
-                                "url": screenshot_url,
-                                "type": "screenshot",
-                                "filename": screenshot_filename,
-                                "created_at": datetime.now(UTC).isoformat() + "Z",
-                            }
-                            tasks[task_id]["media"].append(media_entry)
-                    except Exception as e:
-                        logger.error(f"Error saving final screenshot: {str(e)}")
+                                # Add to media list with type
+                                screenshot_url = f"/media/{task_id}/{screenshot_filename}"
+                                media_entry = {
+                                    "url": screenshot_url,
+                                    "type": "screenshot",
+                                    "filename": screenshot_filename,
+                                    "created_at": datetime.now(UTC).isoformat() + "Z",
+                                }
+                                task_storage.add_task_media(task_id, media_entry, user_id)
+                        except Exception as e:
+                            logger.error(f"Error saving final screenshot: {str(e)}")
             except Exception as e:
                 logger.error(f"Error taking final screenshot: {str(e)}")
                 await browser.close()
@@ -383,13 +401,16 @@ async def execute_task(task_id: str, instruction: str, ai_provider: str):
 
 # API Routes
 @app.post("/api/v1/run-task", response_model=TaskResponse)
-async def run_task(request: TaskRequest):
+async def run_task(request: TaskRequest, user_id: str = Depends(get_user_id)):
     """Start a browser automation task"""
     task_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat() + "Z"
 
+    # Generate live URL
+    live_url = f"/live/{task_id}"
+
     # Initialize task record
-    tasks[task_id] = {
+    task_data = {
         "id": task_id,
         "task": request.task,
         "ai_provider": request.ai_provider,
@@ -407,32 +428,39 @@ async def run_task(request: TaskRequest):
             "headful": request.headful,
             "use_custom_chrome": request.use_custom_chrome,
         },
+        "live_url": live_url,
     }
 
-    # Generate live URL
-    live_url = f"/live/{task_id}"
-    tasks[task_id]["live_url"] = live_url
+    # Store the task in storage
+    task_storage.create_task(task_id, task_data, user_id)
 
     # Start task in background
-    asyncio.create_task(execute_task(task_id, request.task, request.ai_provider))
+    asyncio.create_task(execute_task(task_id, request.task, request.ai_provider, user_id))
 
     return TaskResponse(id=task_id, status=TaskStatus.CREATED, live_url=live_url)
 
 
+async def automated_screenshot(agent, task_id, user_id=DEFAULT_USER_ID):
+    current_page = await agent.browser_context.get_current_page()
+    
+    visit_log = agent.state.history.urls()
+    current_url = current_page.url
+    previous_url = visit_log[-2] if len(visit_log) >= 2 else None
+    logger.info(f"Agent was last on URL: {previous_url} and is now on {current_url}")
+    await capture_screenshot(agent, task_id, user_id)
+
+
 @app.get("/api/v1/task/{task_id}/status", response_model=TaskStatusResponse)
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, user_id: str = Depends(get_user_id)):
     """Get status of a task"""
-    if task_id not in tasks:
+    task = task_storage.get_task(task_id, user_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
     # Only increment steps for running tasks
-    if tasks[task_id]["status"] == TaskStatus.RUNNING:
+    if task["status"] == TaskStatus.RUNNING:
         # Initialize steps array if not present
-        if "steps" not in tasks[task_id]:
-            tasks[task_id]["steps"] = []
-
-        # Create a new step entry
-        current_step = len(tasks[task_id]["steps"]) + 1
+        current_step = len(task.get("steps", [])) + 1
 
         # Add step info
         step_info = {
@@ -442,19 +470,19 @@ async def get_task_status(task_id: str):
             "evaluation_previous_goal": "In progress",
         }
 
-        tasks[task_id]["steps"].append(step_info)
+        task_storage.add_task_step(task_id, step_info, user_id)
         logger.info(f"Added step {current_step} for task {task_id}")
 
-    await capture_screenshot(tasks[task_id].get("agent"), task_id)
+    await capture_screenshot(task_storage.get_task_agent(task_id, user_id), task_id, user_id)
 
     return TaskStatusResponse(
-        status=tasks[task_id]["status"],
-        result=tasks[task_id].get("output"),
-        error=tasks[task_id].get("error"),
+        status=task["status"],
+        result=task.get("output"),
+        error=task.get("error"),
     )
 
 
-async def capture_screenshot(agent, task_id):
+async def capture_screenshot(agent, task_id, user_id=DEFAULT_USER_ID):
     """Capture screenshot from the agent's browser context"""
     logger.info(f"Capturing screenshot for task: {task_id}")
 
@@ -501,23 +529,23 @@ async def capture_screenshot(agent, task_id):
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
                 # Get current step number more reliably
-                if "steps" in tasks[task_id] and tasks[task_id]["steps"]:
+                task = task_storage.get_task(task_id, user_id)
+                if task and "steps" in task and task["steps"]:
                     # Use the latest step number
                     current_step = (
-                        tasks[task_id]["steps"][-1]["step"] - 1
+                        task["steps"][-1]["step"] - 1
                     )  # First page always blank
                 else:
                     current_step = "initial"
 
                 # Generate filename based on when the screenshot was taken
-                if tasks[task_id]["status"] == TaskStatus.FINISHED:
+                if task and task["status"] == TaskStatus.FINISHED:
                     screenshot_filename = f"final-{timestamp}.png"
-                elif tasks[task_id]["status"] == TaskStatus.RUNNING:
+                elif task and task["status"] == TaskStatus.RUNNING:
                     screenshot_filename = f"status-step-{current_step}-{timestamp}.png"
                 else:
-                    screenshot_filename = (
-                        f"status-{tasks[task_id]['status']}-{timestamp}.png"
-                    )
+                    task_status = task["status"] if task else "unknown"
+                    screenshot_filename = f"status-{task_status}-{timestamp}.png"
 
                 screenshot_path = task_media_dir / screenshot_filename
 
@@ -538,10 +566,7 @@ async def capture_screenshot(agent, task_id):
                             "filename": screenshot_filename,
                             "created_at": datetime.now(UTC).isoformat() + "Z",
                         }
-                        # Initialize media list if not present
-                        if "media" not in tasks[task_id]:
-                            tasks[task_id]["media"] = []
-                        tasks[task_id]["media"].append(media_entry)
+                        task_storage.add_task_media(task_id, media_entry, user_id)
                     else:
                         logger.error(
                             f"Screenshot file not created or empty: {screenshot_path}"
@@ -557,107 +582,101 @@ async def capture_screenshot(agent, task_id):
 
 
 @app.get("/api/v1/task/{task_id}", response_model=dict)
-async def get_task(task_id: str):
+async def get_task(task_id: str, user_id: str = Depends(get_user_id)):
     """Get full task details"""
-    if task_id not in tasks:
+    task = task_storage.get_task(task_id, user_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # Return task data excluding agent object
-    task_data = {k: v for k, v in tasks[task_id].items() if k != "agent"}
-    return task_data
+    return task
 
 
 @app.put("/api/v1/stop-task/{task_id}")
-async def stop_task(task_id: str):
+async def stop_task(task_id: str, user_id: str = Depends(get_user_id)):
     """Stop a running task"""
-    if task_id not in tasks:
+    task = task_storage.get_task(task_id, user_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if tasks[task_id]["status"] in [
+    if task["status"] in [
         TaskStatus.FINISHED,
         TaskStatus.FAILED,
         TaskStatus.STOPPED,
     ]:
         return {
-            "message": f"Task already in terminal state: {tasks[task_id]['status']}"
+            "message": f"Task already in terminal state: {task['status']}"
         }
 
     # Get agent
-    agent = tasks[task_id].get("agent")
+    agent = task_storage.get_task_agent(task_id, user_id)
     if agent:
         # Call agent's stop method
         agent.stop()
-        tasks[task_id]["status"] = TaskStatus.STOPPING
+        task_storage.update_task_status(task_id, TaskStatus.STOPPING, user_id)
         return {"message": "Task stopping"}
     else:
-        tasks[task_id]["status"] = TaskStatus.STOPPED
-        tasks[task_id]["finished_at"] = datetime.now(UTC).isoformat() + "Z"
+        task_storage.update_task_status(task_id, TaskStatus.STOPPED, user_id)
+        task_storage.mark_task_finished(task_id, user_id, TaskStatus.STOPPED)
         return {"message": "Task stopped (no agent found)"}
 
 
 @app.put("/api/v1/pause-task/{task_id}")
-async def pause_task(task_id: str):
+async def pause_task(task_id: str, user_id: str = Depends(get_user_id)):
     """Pause a running task"""
-    if task_id not in tasks:
+    task = task_storage.get_task(task_id, user_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if tasks[task_id]["status"] != TaskStatus.RUNNING:
-        return {"message": f"Task not running: {tasks[task_id]['status']}"}
+    if task["status"] != TaskStatus.RUNNING:
+        return {"message": f"Task not running: {task['status']}"}
 
     # Get agent
-    agent = tasks[task_id].get("agent")
+    agent = task_storage.get_task_agent(task_id, user_id)
     if agent:
         # Call agent's pause method
         agent.pause()
-        tasks[task_id]["status"] = TaskStatus.PAUSED
+        task_storage.update_task_status(task_id, TaskStatus.PAUSED, user_id)
         return {"message": "Task paused"}
     else:
         return {"message": "Task could not be paused (no agent found)"}
 
 
 @app.put("/api/v1/resume-task/{task_id}")
-async def resume_task(task_id: str):
+async def resume_task(task_id: str, user_id: str = Depends(get_user_id)):
     """Resume a paused task"""
-    if task_id not in tasks:
+    task = task_storage.get_task(task_id, user_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if tasks[task_id]["status"] != TaskStatus.PAUSED:
-        return {"message": f"Task not paused: {tasks[task_id]['status']}"}
+    if task["status"] != TaskStatus.PAUSED:
+        return {"message": f"Task not paused: {task['status']}"}
 
     # Get agent
-    agent = tasks[task_id].get("agent")
+    agent = task_storage.get_task_agent(task_id, user_id)
     if agent:
         # Call agent's resume method
         agent.resume()
-        tasks[task_id]["status"] = TaskStatus.RUNNING
+        task_storage.update_task_status(task_id, TaskStatus.RUNNING, user_id)
         return {"message": "Task resumed"}
     else:
         return {"message": "Task could not be resumed (no agent found)"}
 
 
 @app.get("/api/v1/list-tasks")
-async def list_tasks():
+async def list_tasks(
+    user_id: str = Depends(get_user_id),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(100, ge=1, le=1000)
+):
     """List all tasks"""
-    task_list = []
-    for task_id, task_data in tasks.items():
-        # Return task data excluding agent object
-        task_summary = {
-            "id": task_data["id"],
-            "status": task_data["status"],
-            "task": task_data.get("task", ""),
-            "created_at": task_data.get("created_at", ""),
-            "finished_at": task_data.get("finished_at"),
-            "live_url": task_data.get("live_url", f"/live/{task_id}"),
-        }
-        task_list.append(task_summary)
-
-    return {"tasks": task_list, "total": len(task_list), "page": 1, "per_page": 100}
+    return task_storage.list_tasks(user_id, page, per_page)
 
 
 @app.get("/live/{task_id}", response_class=HTMLResponse)
-async def live_view(task_id: str):
+async def live_view(task_id: str, user_id: str = Depends(get_user_id)):
     """Get a live view of a task that can be embedded in an iframe"""
-    if task_id not in tasks:
+    task = task_storage.get_task(task_id, user_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
     html_content = f"""
@@ -706,10 +725,17 @@ async def live_view(task_id: str):
                 const FINISHED = '{TaskStatus.FINISHED}';
                 const FAILED = '{TaskStatus.FAILED}';
                 const STOPPED = '{TaskStatus.STOPPED}';
+                const userId = '{user_id}';
+                
+                // Set user ID in request headers if available
+                const headers = {{}};
+                if (userId && userId !== 'default') {{
+                    headers['X-User-ID'] = userId;
+                }}
                 
                 // Update status function
                 function updateStatus() {{
-                    fetch(`/api/v1/task/${{taskId}}/status`)
+                    fetch(`/api/v1/task/${{taskId}}/status`, {{ headers }})
                         .then(response => response.json())
                         .then(data => {{
                             // Update status element
@@ -735,7 +761,7 @@ async def live_view(task_id: str):
                         }});
                         
                     // Also fetch full task to get steps
-                    fetch(`/api/v1/task/${{taskId}}`)
+                    fetch(`/api/v1/task/${{taskId}}`, {{ headers }})
                         .then(response => response.json())
                         .then(data => {{
                             if (data.steps && data.steps.length > 0) {{
@@ -758,14 +784,20 @@ async def live_view(task_id: str):
                 
                 // Setup control buttons
                 document.getElementById('pauseBtn').addEventListener('click', () => {{
-                    fetch(`/api/v1/pause-task/${{taskId}}`, {{ method: 'PUT' }})
+                    fetch(`/api/v1/pause-task/${{taskId}}`, {{ 
+                        method: 'PUT',
+                        headers
+                    }})
                         .then(response => response.json())
                         .then(data => alert(data.message))
                         .catch(error => console.error('Error pausing task:', error));
                 }});
                 
                 document.getElementById('resumeBtn').addEventListener('click', () => {{
-                    fetch(`/api/v1/resume-task/${{taskId}}`, {{ method: 'PUT' }})
+                    fetch(`/api/v1/resume-task/${{taskId}}`, {{ 
+                        method: 'PUT',
+                        headers
+                    }})
                         .then(response => response.json())
                         .then(data => alert(data.message))
                         .catch(error => console.error('Error resuming task:', error));
@@ -773,7 +805,10 @@ async def live_view(task_id: str):
                 
                 document.getElementById('stopBtn').addEventListener('click', () => {{
                     if (confirm('Are you sure you want to stop this task? This action cannot be undone.')) {{
-                        fetch(`/api/v1/stop-task/${{taskId}}`, {{ method: 'PUT' }})
+                        fetch(`/api/v1/stop-task/${{taskId}}`, {{ 
+                            method: 'PUT',
+                            headers
+                        }})
                             .then(response => response.json())
                             .then(data => alert(data.message))
                             .catch(error => console.error('Error stopping task:', error));
@@ -822,13 +857,14 @@ async def browser_config():
 
 
 @app.get("/api/v1/task/{task_id}/media")
-async def get_task_media(task_id: str, type: Optional[str] = None):
+async def get_task_media(task_id: str, user_id: str = Depends(get_user_id), type: Optional[str] = None):
     """Returns links to any recordings or media generated during task execution"""
-    if task_id not in tasks:
+    task = task_storage.get_task(task_id, user_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
     # Check if task is completed
-    if tasks[task_id]["status"] not in [
+    if task["status"] not in [
         TaskStatus.FINISHED,
         TaskStatus.FAILED,
         TaskStatus.STOPPED,
@@ -851,18 +887,21 @@ async def get_task_media(task_id: str, type: Optional[str] = None):
 
     # If we have files but no media entries, create them now
     if media_files and (
-        not tasks[task_id].get("media") or len(tasks[task_id].get("media", [])) == 0
+        not task.get("media") or len(task.get("media", [])) == 0
     ):
-        tasks[task_id]["media"] = []
         for file_path in media_files:
             if file_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
                 file_url = f"/media/{task_id}/{file_path.name}"
-                tasks[task_id]["media"].append(
-                    {"url": file_url, "type": "screenshot", "filename": file_path.name}
-                )
+                media_entry = {
+                    "url": file_url, 
+                    "type": "screenshot", 
+                    "filename": file_path.name
+                }
+                task_storage.add_task_media(task_id, media_entry, user_id)
 
-    # Get media list
-    media_list = tasks[task_id].get("media", [])
+    # Get updated task with media
+    task = task_storage.get_task(task_id, user_id)
+    media_list = task.get("media", [])
 
     # Filter by type if specified
     if type and isinstance(media_list, list):
@@ -891,10 +930,13 @@ async def get_task_media(task_id: str, type: Optional[str] = None):
 
 
 @app.get("/api/v1/task/{task_id}/media/list")
-async def list_task_media(task_id: str, type: Optional[str] = None):
+async def list_task_media(task_id: str, user_id: str = Depends(get_user_id), type: Optional[str] = None):
     """Returns detailed information about media files associated with a task"""
     # Check if the media directory exists
     task_media_dir = MEDIA_DIR / task_id
+
+    if not task_storage.task_exists(task_id, user_id):
+        raise HTTPException(status_code=404, detail="Task not found")
 
     if not task_media_dir.exists():
         return {
