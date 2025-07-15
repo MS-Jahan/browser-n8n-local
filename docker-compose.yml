@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "24006:8000"
+      - "8000:8000"
     environment:
       # API Configuration
       - PORT=8000
