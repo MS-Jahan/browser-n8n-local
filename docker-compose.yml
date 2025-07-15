@@ -5,8 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    ports:
-      - "18080:18080"
+    expose:
+      - 18080
     environment:
       # API Configuration
       - PORT=18080
