@@ -40,7 +40,7 @@ RUN mkdir -p /app/data && chmod 777 /app/data
 RUN mkdir -p /app/media && chmod 777 /app/media
 
 # Expose the port the app runs on
-EXPOSE 8000
+EXPOSE 18080
 
 # Create a non-root user to run the app
 RUN adduser --disabled-password --gecos "" appuser
